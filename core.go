@@ -52,7 +52,7 @@ func BeginTransaction(txn string, debit map[string]int64, credit map[string]int6
 		return "", errUnbalanced
 	}
 
-	session := rootSession.Clone()
+	session := rootSession.Copy()
 	defer session.Close()
 
 	// Insert transaction
@@ -77,7 +77,7 @@ func BeginTransaction(txn string, debit map[string]int64, credit map[string]int6
 }
 
 func CommitTransaction() error {
-	session := rootSession.Clone()
+	session := rootSession.Copy()
 	defer session.Close()
 
 	tx := Transaction{}
@@ -96,6 +96,10 @@ func CommitTransaction() error {
 		return nil
 	}
 
+	return Apply(session, &tx)
+}
+
+func Apply(session *mgo.Session, tx *Transaction) error {
 	// Apply the transaction to all accounts.
 	for acID, amt := range tx.Changes {
 		query := bson.M{"_id": acID, "txs": bson.M{"$ne": tx.ID}}
@@ -104,13 +108,17 @@ func CommitTransaction() error {
 	}
 
 	// Update transaction state to applied.
-	query = bson.M{"_id": tx.ID, "stat": TxPending}
+	query := bson.M{"_id": tx.ID, "stat": TxPending}
 	update := bson.M{"$set": bson.M{"stat": TxApplied}, "$currentDate": bson.M{"date": true}}
-	err = session.DB("").C("transactions").Update(query, update)
+	err := session.DB("").C("transactions").Update(query, update)
 	if err != nil {
 		return fmt.Errorf("bigtx: update state pending -> apply error: %v", err)
 	}
 
+	return MarkDone(session, tx)
+}
+
+func MarkDone(session *mgo.Session, tx *Transaction) error {
 	// Update all accounts’ list of pending transactions.
 	for acID, _ := range tx.Changes {
 		query := bson.M{"_id": acID, "txs": tx.ID}
@@ -119,9 +127,9 @@ func CommitTransaction() error {
 	}
 
 	// Update transaction state to done.
-	query = bson.M{"_id": tx.ID, "stat": TxApplied}
-	update = bson.M{"$set": bson.M{"stat": TxDone}, "$currentDate": bson.M{"date": true}}
-	err = session.DB("").C("transactions").Update(query, update)
+	query := bson.M{"_id": tx.ID, "stat": TxApplied}
+	update := bson.M{"$set": bson.M{"stat": TxDone}, "$currentDate": bson.M{"date": true}}
+	err := session.DB("").C("transactions").Update(query, update)
 	if err != nil {
 		return fmt.Errorf("bigtx: update state apply -> done error: %v", err)
 	}
@@ -129,25 +137,42 @@ func CommitTransaction() error {
 	return nil
 }
 
-func CreateAccount(acID string, side AccountSide) error {
-	session := rootSession.Clone()
+// Recover resumes the transaction in process that crashed
+func Recover() error {
+	session := rootSession.Copy()
 	defer session.Close()
 
-	_, err := session.DB("").C("accounts").UpsertId(acID, bson.M{"$setOnInsert": bson.M{"bal": 0, "side": side}})
-	return err
-}
-
-func ReadBalance(account string) (int64, error) {
-	session := rootSession.Clone()
-	defer session.Close()
-
-	doc := Account{}
-	err := session.DB("").C("accounts").FindId(account).One(&doc)
-	if err != nil {
-		return 0, fmt.Errorf("bigtx: find error: %v", err)
+	tx := Transaction{}
+	query := bson.M{
+		"stat": TxPending,
+		"date": bson.M{"$lt": time.Now().Add(-30 * time.Second)},
+	}
+	err := session.DB("").C("transactions").Find(query).One(&tx)
+	if err != nil && err != mgo.ErrNotFound {
+		return fmt.Errorf("bigtx: find for recover: %v", err)
 	}
 
-	return doc.Balance, nil
+	if err == nil {
+		err = Apply(session, &tx)
+		if err != nil {
+			return err
+		}
+	}
+
+	query = bson.M{
+		"stat": TxApplied,
+		"date": bson.M{"$lt": time.Now().Add(-30 * time.Second)},
+	}
+	err = session.DB("").C("transactions").Find(query).One(&tx)
+	if err != nil && err != mgo.ErrNotFound {
+		return fmt.Errorf("bigtx: find for recover: %v", err)
+	}
+
+	if err == nil {
+		return MarkDone(session, &tx)
+	}
+
+	return nil
 }
 
 var errUnbalanced = errors.New("bigtx: debit/credit not balance")
